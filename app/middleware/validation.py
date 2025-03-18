@@ -1,159 +1,193 @@
 """
-Hata İşleme Middleware
---------------------
-Flask uygulaması için merkezi hata işleme fonksiyonları.
+Doğrulama Middleware
+------------------
+API isteklerini doğrulamak için middleware fonksiyonları.
 """
 
-import logging
-from pynamodb.exceptions import DoesNotExist
-from flask import jsonify
-from werkzeug.exceptions import HTTPException
-from app.utils.exceptions import ApiError, AuthError, NotFoundError, ValidationError, ForbiddenError
+import re
+import uuid
+from functools import wraps
+from flask import request, jsonify, g
+from app.utils.exceptions import ValidationError
+from app.utils.responses import error_response
 
-# Logger yapılandırması
-logger = logging.getLogger(__name__)
-
-def register_error_handlers(app):
+def validate_schema(schema):
     """
-    Uygulamaya hata işleyicileri kaydeder.
+    İstek verilerini belirtilen şemaya göre doğrular.
     
     Args:
-        app: Flask uygulaması
+        schema: Marshmallow şeması
+        
+    Returns:
+        function: Decorator fonksiyonu
     """
-    
-    @app.errorhandler(ApiError)
-    def handle_api_error(error):
-        """
-        Özel API hatalarını işler.
-        
-        Args:
-            error (ApiError): API hatası
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            # Form veya JSON verileri
+            is_json = request.is_json
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = error.to_dict()
-        logger.error(f"API Error: {error.message}", exc_info=True)
-        return jsonify(response), error.status_code
-    
-    @app.errorhandler(AuthError)
-    def handle_auth_error(error):
-        """
-        Kimlik doğrulama hatalarını işler.
-        
-        Args:
-            error (AuthError): Kimlik doğrulama hatası
+            if is_json:
+                data = request.json
+            else:
+                data = request.form.to_dict()
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = error.to_dict()
-        logger.error(f"Auth Error: {error.message}")
-        return jsonify(response), error.status_code
-    
-    @app.errorhandler(NotFoundError)
-    def handle_not_found_error(error):
-        """
-        Bulunamadı hatalarını işler.
-        
-        Args:
-            error (NotFoundError): Bulunamadı hatası
+            # Şema ile doğrula
+            errors = schema.validate(data)
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = error.to_dict()
-        logger.info(f"Not Found Error: {error.message}")
-        return jsonify(response), error.status_code
-    
-    @app.errorhandler(ValidationError)
-    def handle_validation_error(error):
-        """
-        Doğrulama hatalarını işler.
-        
-        Args:
-            error (ValidationError): Doğrulama hatası
+            if errors:
+                return error_response("Doğrulama hatası", 400, errors)
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = error.to_dict()
-        logger.info(f"Validation Error: {error.message}")
-        return jsonify(response), error.status_code
-    
-    @app.errorhandler(ForbiddenError)
-    def handle_forbidden_error(error):
-        """
-        Yasaklı erişim hatalarını işler.
-        
-        Args:
-            error (ForbiddenError): Yasaklı erişim hatası
+            # Doğrulanmış verileri çıkart
+            validated_data = schema.dump(schema.load(data))
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = error.to_dict()
-        logger.warning(f"Forbidden Error: {error.message}")
-        return jsonify(response), error.status_code
-    
-    @app.errorhandler(DoesNotExist)
-    def handle_does_not_exist(error):
-        """
-        DynamoDB öğe bulunamadı hatalarını işler.
-        
-        Args:
-            error (DoesNotExist): DynamoDB bulunamadı hatası
+            # Verileri request nesnesine ekle
+            request.validated_data = validated_data
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = {
-            'status': 'error',
-            'message': 'İstenen kaynak bulunamadı'
-        }
-        return jsonify(response), 404
+            return f(*args, **kwargs)
+        
+        return wrapper
     
-    @app.errorhandler(HTTPException)
-    def handle_http_exception(error):
-        """
-        HTTP hatalarını işler.
-        
-        Args:
-            error (HTTPException): HTTP hatası
-            
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        response = {
-            'status': 'error',
-            'message': error.description
-        }
-        logger.error(f"HTTP Exception: {error}")
-        return jsonify(response), error.code
+    return decorator
+
+def validate_path_param(param_name, validator_func):
+    """
+    URL yol parametresini doğrular.
     
-    @app.errorhandler(Exception)
-    def handle_generic_exception(error):
-        """
-        Genel istisnaları işler.
+    Args:
+        param_name (str): Parametre adı
+        validator_func (function): Doğrulama fonksiyonu
         
-        Args:
-            error (Exception): Genel istisna
+    Returns:
+        function: Decorator fonksiyonu
+    """
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if param_name in kwargs:
+                value = kwargs[param_name]
+                
+                if not validator_func(value):
+                    return error_response(f"Geçersiz {param_name} parametresi", 400)
             
-        Returns:
-            tuple: Hata yanıtı ve HTTP durum kodu
-        """
-        # Beklenmeyen hataları günlüğe kaydet
-        logger.exception(f"Unhandled Exception: {str(error)}")
+            return f(*args, **kwargs)
         
-        # Hata mesajını kullanıcıya gösterme (güvenlik)
-        response = {
-            'status': 'error',
-            'message': 'Sunucu hatası oluştu'
-        }
+        return wrapper
+    
+    return decorator
+
+def validate_query_params(validators):
+    """
+    Sorgu parametrelerini doğrular.
+    
+    Args:
+        validators (dict): Parametre adı ve doğrulama fonksiyonu eşleşmeleri
         
-        # Debug modunda ise hata detaylarını da gönder
-        if app.debug:
-            response['error'] = str(error)
-            response['traceback'] = str(error.__traceback__)
+    Returns:
+        function: Decorator fonksiyonu
+    """
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            for param_name, validator_func in validators.items():
+                if param_name in request.args:
+                    value = request.args.get(param_name)
+                    
+                    if not validator_func(value):
+                        return error_response(f"Geçersiz {param_name} parametre değeri", 400)
+            
+            return f(*args, **kwargs)
         
-        return jsonify(response), 500
+        return wrapper
+    
+    return decorator
+
+# Doğrulama yardımcı fonksiyonları
+def is_uuid(value):
+    """
+    Değerin geçerli bir UUID olup olmadığını kontrol eder.
+    
+    Args:
+        value (str): Kontrol edilecek değer
+        
+    Returns:
+        bool: Değer geçerli bir UUID ise True, değilse False
+    """
+    try:
+        uuid_obj = uuid.UUID(str(value))
+        return str(uuid_obj) == value or value.startswith(('usr_', 'frm_', 'cmt_', 'grp_', 'pol_', 'med_'))
+    except (ValueError, AttributeError):
+        return False
+
+def is_positive_integer(value):
+    """
+    Değerin pozitif bir tamsayı olup olmadığını kontrol eder.
+    
+    Args:
+        value: Kontrol edilecek değer
+        
+    Returns:
+        bool: Değer pozitif bir tamsayı ise True, değilse False
+    """
+    try:
+        num = int(value)
+        return num > 0
+    except (ValueError, TypeError):
+        return False
+
+def is_boolean(value):
+    """
+    Değerin boolean olarak değerlendirilebilirliğini kontrol eder.
+    
+    Args:
+        value: Kontrol edilecek değer
+        
+    Returns:
+        bool: Değer boolean olarak değerlendirilebilir ise True, değilse False
+    
+    Note:
+        "true", "false", "1", "0", True, False değerleri kabul edilir.
+    """
+    if isinstance(value, bool):
+        return True
+    
+    if isinstance(value, str):
+        lower_value = value.lower()
+        if lower_value in ('true', 'false', '1', '0'):
+            return True
+    
+    if isinstance(value, (int, float)):
+        if value in (0, 1):
+            return True
+    
+    return False
+
+def is_email(value):
+    """
+    Değerin geçerli bir e-posta adresi olup olmadığını kontrol eder.
+    
+    Args:
+        value (str): Kontrol edilecek değer
+        
+    Returns:
+        bool: Değer geçerli bir e-posta adresi ise True, değilse False
+    """
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not isinstance(value, str):
+        return False
+    return bool(re.match(email_pattern, value))
+
+def is_url(value):
+    """
+    Değerin geçerli bir URL olup olmadığını kontrol eder.
+    
+    Args:
+        value (str): Kontrol edilecek değer
+        
+    Returns:
+        bool: Değer geçerli bir URL ise True, değilse False
+    """
+    url_pattern = r'^(https?:\/\/)?([\da-z.-]+)\.([a-z.]{2,6})([\/\w .-]*)*\/?$'
+    if not isinstance(value, str):
+        return False
+    return bool(re.match(url_pattern, value))
